@@ -167,23 +167,25 @@ module ActiveRecord #:nodoc:
 
         cattr_accessor :versioned_class_name, :versioned_foreign_key, :versioned_table_name, :versioned_inheritance_column,
                        :version_column, :max_version_limit, :track_altered_attributes, :version_condition, :version_sequence_name, :non_versioned_columns,
-                       :version_association_options, :version_if_changed, :version_except_columns
+                       :version_association_options, :version_if_changed, :version_except_columns, :versioned_table_connection, :no_version_column_on_original_table
 
-        self.versioned_class_name         = options[:class_name] || "Version"
-        self.versioned_foreign_key        = options[:foreign_key] || self.to_s.foreign_key
-        self.versioned_table_name         = options[:table_name] || "#{table_name_prefix}#{base_class.name.demodulize.underscore}_versions#{table_name_suffix}"
-        self.versioned_inheritance_column = options[:inheritance_column] || "versioned_#{inheritance_column}"
-        self.version_column               = options[:version_column] || 'version'
-        self.version_sequence_name        = options[:sequence_name]
-        self.max_version_limit            = options[:limit].to_i
-        self.version_condition            = options[:if] || true
-        self.version_except_columns       = [options[:except]].flatten.map(&:to_s)  #these columns are kept in _versioned, but changing them does not excplitly cause a version change
-        self.non_versioned_columns        = [self.primary_key, inheritance_column, self.version_column, 'lock_version', versioned_inheritance_column] #these columns are excluded from _versions, and changing them does not cause a version change
-        self.version_association_options  = {
-            :class_name  => "#{self.to_s}::#{versioned_class_name}",
-            :foreign_key => versioned_foreign_key,
-            :dependent   => options[:dependent_version_association] || nil
-        }.merge(options[:association_options] || {})
+        self.versioned_class_name                = options[:class_name] || "Version"
+        self.versioned_foreign_key               = options[:foreign_key] || self.to_s.foreign_key
+        self.versioned_table_name                = options[:table_name] || "#{table_name_prefix}#{base_class.name.demodulize.underscore}_versions#{table_name_suffix}"
+        self.versioned_inheritance_column        = options[:inheritance_column] || "versioned_#{inheritance_column}"
+        self.version_column                      = options[:version_column] || 'version'
+        self.version_sequence_name               = options[:sequence_name]
+        self.max_version_limit                   = options[:limit].to_i
+        self.version_condition                   = options[:if] || true
+        self.version_except_columns              = [options[:except]].flatten.map(&:to_s)  #these columns are kept in _versioned, but changing them does not excplitly cause a version change
+        self.non_versioned_columns               = [self.primary_key, inheritance_column, self.version_column, 'lock_version', versioned_inheritance_column] #these columns are excluded from _versions, and changing them does not cause a version change
+        self.version_association_options         = {
+                                                     :class_name  => "#{self.to_s}::#{versioned_class_name}",
+                                                     :foreign_key => versioned_foreign_key,
+                                                     :dependent   => options[:dependent_version_association] || nil
+                                                   }.merge(options[:association_options] || {})
+        self.versioned_table_connection          = options[:versioned_table_connection] if options[:versioned_table_connection].present?
+        self.no_version_column_on_original_table = options[:no_version_column_on_original_table]
 
         if block_given?
           extension_module_name = "#{versioned_class_name}Extension"
@@ -257,6 +259,7 @@ module ActiveRecord #:nodoc:
                                    :foreign_key => versioned_foreign_key
         versioned_class.send :include, options[:extend] if options[:extend].is_a?(Module)
         versioned_class.set_sequence_name version_sequence_name if version_sequence_name
+        versioned_class.establish_connection(self.versioned_table_connection) if self.versioned_table_connection
       end
 
       module Behaviors
@@ -276,7 +279,12 @@ module ActiveRecord #:nodoc:
             @saving_version = nil
             rev = self.class.versioned_class.create
             clone_versioned_model(self, rev)
-            rev.send("#{self.class.version_column}=", send(self.class.version_column))
+            # if the original class doesn't have have a version column, we'll have to infer it from the versions themselves
+            if self.no_version_column_on_original_table
+              rev.send("#{self.class.version_column}=", self.next_version)
+            else
+	      rev.send("#{self.class.version_column}=", send(self.class.version_column))
+            end
             rev.send("#{self.class.versioned_foreign_key}=", id)
             rev.save
           end
@@ -284,7 +292,7 @@ module ActiveRecord #:nodoc:
 
         # Clears old revisions if a limit is set with the :limit option in <tt>acts_as_versioned</tt>.
         # Override this method to set your own criteria for clearing old versions.
-        def clear_old_versions
+        def clear_old_versions 
           return if self.class.max_version_limit == 0
           excess_baggage = send(self.class.version_column).to_i - self.class.max_version_limit
           if excess_baggage > 0
@@ -400,7 +408,7 @@ module ActiveRecord #:nodoc:
         # sets the new version before saving, unless you're using optimistic locking.  In that case, let it take care of the version.
         def set_new_version
           @saving_version = new_record? || save_version?
-          self.send("#{self.class.version_column}=", next_version) if new_record? || (!locking_enabled? && save_version?)
+          self.send("#{self.class.version_column}=", next_version) if (new_record? || (!locking_enabled? && save_version?)) && !self.no_version_column_on_original_table
         end
 
         # Gets the next available version for the current record, or 1 for a new record
@@ -423,20 +431,20 @@ module ActiveRecord #:nodoc:
           # Rake migration task to create the versioned table using options passed to acts_as_versioned
           def create_versioned_table(create_table_options = {})
             # create version column in main table if it does not exist
-            if !self.content_columns.find { |c| [version_column.to_s, 'lock_version'].include? c.name }
+            if !self.no_version_column_on_original_table && !self.content_columns.find { |c| [version_column.to_s, 'lock_version'].include? c.name }
               self.connection.add_column table_name, version_column, :integer
               self.reset_column_information
             end
 
-            return if connection.table_exists?(versioned_table_name)
+            return if versioned_class.connection.table_exists?(versioned_table_name)
 
-            self.connection.create_table(versioned_table_name, create_table_options) do |t|
+            versioned_class.connection.create_table(versioned_table_name, create_table_options) do |t|
               t.column versioned_foreign_key, :integer
               t.column version_column, :integer
             end
 
             self.versioned_columns.each do |col|
-              self.connection.add_column versioned_table_name, col.name, col.type,
+              versioned_class.connection.add_column versioned_table_name, col.name, col.type,
                                          :limit     => col.limit,
                                          :default   => col.default,
                                          :scale     => col.scale,
@@ -444,7 +452,7 @@ module ActiveRecord #:nodoc:
             end
 
             if type_col = self.columns_hash[inheritance_column]
-              self.connection.add_column versioned_table_name, versioned_inheritance_column, type_col.type,
+              versioned_class.connection.add_column versioned_table_name, versioned_inheritance_column, type_col.type,
                                          :limit     => type_col.limit,
                                          :default   => type_col.default,
                                          :scale     => type_col.scale,
@@ -453,12 +461,12 @@ module ActiveRecord #:nodoc:
 
             # Limit index name length to 63, the Postgresql limit of NAMEDATALEN-1.
             name = 'index_' + versioned_table_name + '_on_' + versioned_foreign_key
-            self.connection.add_index versioned_table_name, versioned_foreign_key, :name => name[0,63]
+            versioned_class.connection.add_index versioned_table_name, versioned_foreign_key, :name => name[0,63]
           end
 
           # Rake migration task to drop the versioned table
           def drop_versioned_table
-            self.connection.drop_table versioned_table_name
+            versioned_class.connection.drop_table versioned_table_name
           end
 
           # Executes the block with the versioning callbacks disabled.
