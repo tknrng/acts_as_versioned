@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
   spec.email         = ["sommerm@vmware.com"]
   spec.summary       = %q{Active Record model versioning}
   spec.description   = %q{Active Record model versioning, with adjustments made for Rails 4 and PostgreSQL.}
-  spec.homepage      = "https://github.com/mjsommer/acts_as_versioned"
+  spec.homepage      = "https://github.com/tknrng/acts_as_versioned"
   spec.license       = "MIT"
 
   spec.files         = `git ls-files`.split($/)
